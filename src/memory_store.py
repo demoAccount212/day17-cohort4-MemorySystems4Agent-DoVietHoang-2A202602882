@@ -1,86 +1,145 @@
 from __future__ import annotations
 
+import math
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 def estimate_tokens(text: str) -> int:
-    """Student TODO: implement a simple token estimator.
+    """Heuristic token estimator.
 
-    Example idea:
-    - Strip whitespace
-    - Return 0 for empty text
-    - Approximate tokens from character count, e.g. len(text) / 4
+    - Return 0 for empty/whitespace-only text
+    - Approximate tokens from character count: len(text.strip()) / 4
     """
-
-    raise NotImplementedError
+    if not text or not text.strip():
+        return 0
+    return max(1, math.ceil(len(text.strip()) / 4))
 
 
 @dataclass
 class UserProfileStore:
     """Persistent storage for `User.md`.
 
-    Student TODO:
-    - Map each user id to one markdown file
-    - Support read / write / edit operations
-    - Optionally expose helpers like `facts()` or `upsert_fact()`
+    Maps each user id to one markdown file under root_dir.
+    Supports read / write / edit operations.
+    Optionally exposes helpers like facts() or upsert_fact().
     """
 
     root_dir: Path
 
+    def _slugify_user_id(self, user_id: str) -> str:
+        """Slugify: keep [A-Za-z0-9_.-], replace anything else with '_'."""
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", user_id)
+        # prevent escaping root_dir (e.g. ../)
+        if safe.startswith(".."):
+            safe = "_" + safe
+        return safe
+
     def path_for(self, user_id: str) -> Path:
-        # TODO: slugify or sanitize the user id before building the file path.
-        raise NotImplementedError
+        """Return the User.md file path for a user_id.
+
+        The file lives at <root_dir>/<slug>/User.md.
+        Parent directories are auto-created when writing.
+        """
+        slug = self._slugify_user_id(user_id)
+        full = (self.root_dir / slug / "User.md").resolve()
+        root_resolved = self.root_dir.resolve()
+        # safety: reject any path outside root_dir
+        if str(full).startswith(str(root_resolved)) or str(full).startswith(str(root_resolved) + os.sep):
+            return self.root_dir / slug / "User.md"
+        # fallback — keep under root_dir only
+        return self.root_dir / slug / "User.md"
 
     def read_text(self, user_id: str) -> str:
-        # TODO: return file content or an empty default markdown profile.
-        raise NotImplementedError
+        """Return file content (utf-8) if it exists, else a default markdown profile."""
+        p = self.path_for(user_id)
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+        # default profile
+        return "# User Profile\n"
 
     def write_text(self, user_id: str, content: str) -> Path:
-        # TODO: write markdown to disk and return the file path.
-        raise NotImplementedError
+        """Write markdown to disk and return the file path.
+
+        Parents are created automatically.
+        """
+        p = self.path_for(user_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return p
 
     def edit_text(self, user_id: str, search_text: str, replacement: str) -> bool:
-        # TODO: replace one occurrence inside User.md and return whether it changed.
-        raise NotImplementedError
+        """Replace the FIRST occurrence of search_text inside User.md.
+
+        Return True if changed (and actually wrote), False if search_text not found
+        (do not create/modify the file when not found).
+        """
+        p = self.path_for(user_id)
+        if not p.exists():
+            return False
+        content = p.read_text(encoding="utf-8")
+        idx = content.find(search_text)
+        if idx == -1:
+            return False
+        new_content = content[:idx] + replacement + content[idx + len(search_text) :]
+        p.write_text(new_content, encoding="utf-8")
+        return True
 
     def file_size(self, user_id: str) -> int:
-        # TODO: return the current file size in bytes.
-        raise NotImplementedError
+        """Return the current file size in bytes. 0 if missing."""
+        p = self.path_for(user_id)
+        if p.exists():
+            return p.stat().st_size
+        return 0
 
+    def facts(self, user_id: str) -> dict[str, str]:
+        """Parse and return stable profile facts from the stored User.md.
 
-def extract_profile_updates(message: str) -> dict[str, str]:
-    """Student TODO: convert raw user text into stable profile facts.
+        Fact lines are of the form `- **key**: value` or `- key: value`.
+        Only the last occurrence of each key is kept.
+        """
+        content = self.read_text(user_id)
+        facts = {}
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("- **") and "**:" in line:
+                # Format: - **key**: value
+                key_part, _, value = line[4:].partition("**:")
+                key = key_part.strip()
+                facts[key] = value.strip()
+            elif line.startswith("- ") and ": " in line:
+                # Format: - key: value
+                key_part, _, value = line[2:].partition(": ")
+                facts[key_part.strip()] = value.strip()
+        return facts
 
-    Example facts you may want to extract:
-    - name
-    - location
-    - profession
-    - preferences / response style
-    - favorite food / drink
+    def upsert_fact(self, user_id: str, key: str, value: str) -> None:
+        """Insert or update a fact in the profile."""
+        path = self.path_for(user_id)
+        content = self.read_text(user_id)
+        facts = self.facts(user_id)
+        facts[key] = value
 
-    Pseudocode:
-    1. Build a few regex patterns.
-    2. Skip obvious question-only turns.
-    3. Return only the facts that are confidently present in the message.
-    """
+        # Rebuild the Facts section
+        facts_lines = [f"- **{k}**: {v}" for k, v in facts.items()]
+        facts_section = "\n".join(facts_lines)
 
-    raise NotImplementedError
+        # Replace the Facts section
+        if "## Facts" in content:
+            before, _, after = content.partition("## Facts")
+            _, _, after = after.partition("\n\n")
+            new_content = before + "## Facts\n\n" + facts_section + "\n\n" + after
+        else:
+            new_content = content.rstrip() + "\n\n## Facts\n\n" + facts_section + "\n"
 
-
-def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
-    """Student TODO: create a compact summary of older messages.
-
-    This can be heuristic text concatenation first.
-    Later, you can replace it with an LLM-based summary if desired.
-    """
-
-    raise NotImplementedError
+        self.write_text(user_id, new_content)
 
 
 @dataclass
 class CompactMemoryManager:
-    """Student TODO: implement compact memory for long threads.
+    """Compact memory for long threads.
 
     Goal:
     - Keep recent messages in full
@@ -92,17 +151,181 @@ class CompactMemoryManager:
     keep_messages: int
     state: dict[str, dict[str, object]] = field(default_factory=dict)
 
+    def _compact(self, thread_id: str) -> None:
+        """Summarize messages beyond keep_messages, keep the tail of kept_messages."""
+        st = self.state.get(thread_id)
+        if st is None:
+            return
+        msgs: list[dict[str, str]] = st.get("messages", [])
+        summary: str = st.get("summary", "")
+        compactions: int = st.get("compactions", 0)
+
+        # If keep_messages <= 0, keep at least 1 message
+        k = max(1, self.keep_messages)
+
+        if len(msgs) <= k:
+            # nothing to compact; already fits
+            return
+
+        # summarize all but the last k messages
+        to_summarize = msgs[:-k] if len(msgs) > k else []
+        new_summary_parts: list[str] = []
+        for m in to_summarize:
+            content = m.get("content", "")
+            # truncate to ~120 chars as a heuristic
+            truncated = content[:120]
+            new_summary_parts.append(truncated)
+
+        new_summary = summary + " " + " ".join(new_summary_parts) if summary else " ".join(new_summary_parts)
+        # compaction: keep the tail k messages + new summary
+        new_msgs = msgs[-k:] if k > 0 else msgs
+        self.state[thread_id] = {
+            "messages": new_msgs,
+            "summary": new_summary,
+            "compactions": st["compactions"] + 1,
+        }
+
+    def _ensure_state(self, thread_id: str) -> None:
+        """Create per-thread state if missing."""
+        if thread_id not in self.state:
+            self.state[thread_id] = {
+                "messages": [],
+                "summary": "",
+                "compactions": 0,
+            }
+
     def append(self, thread_id: str, role: str, content: str) -> None:
-        # TODO:
-        # 1. create thread state if missing
-        # 2. append the new message
-        # 3. trigger compaction if needed
-        raise NotImplementedError
+        """Append a new message and trigger compaction if needed."""
+        self._ensure_state(thread_id)
+        st = self.state[thread_id]
+
+        # append the new message
+        st["messages"].append({"role": role, "content": content})
+
+        # trigger compaction if needed
+        all_tokens = sum(
+            estimate_tokens(m["content"]) for m in st["messages"]
+        ) + estimate_tokens(st["summary"])
+
+        if all_tokens > self.threshold_tokens and len(st["messages"]) > self.keep_messages:
+            self._compact(thread_id)
 
     def context(self, thread_id: str) -> dict[str, object]:
-        # TODO: return per-thread state with keys like messages, summary, compactions.
-        raise NotImplementedError
+        """Return per-thread state dict (create if missing)."""
+        if thread_id not in self.state:
+            self._ensure_state(thread_id)
+        return self.state[thread_id]
 
     def compaction_count(self, thread_id: str) -> int:
-        # TODO: return number of compactions for this thread.
-        raise NotImplementedError
+        """Return number of compactions for this thread. 0 if unknown."""
+        if thread_id not in self.state:
+            return 0
+        return self.state[thread_id]["compactions"]
+
+
+def extract_profile_updates(message: str) -> dict[str, str]:
+    """Extract stable profile facts from user message.
+
+    Looks for patterns like:
+    - "Tôi tên là X" / "My name is X"
+    - "Tôi ở X" / "I live in X" / "Tôi sống ở X"
+    - "Tôi làm X" / "I work as X" / "Nghề nghiệp: X"
+    - "Tôi thích X" / "I like X" / "Sở thích: X"
+    - "Phong cách: X" / "Style: X"
+    """
+    facts = {}
+    msg_lower = message.lower().strip()
+
+    # Skip obvious questions (contain ? or start with question words)
+    question_starters = (
+        "lam sao", "giup", "cho biet", "cho toi", "biet", "co phai",
+        "what", "how", "who", "where", "when", "why", "can you",
+        "could you", "tell me", "explain"
+    )
+    if "?" in message or any(msg_lower.startswith(q) for q in question_starters):
+        return facts
+
+    # Name patterns (handles both Vietnamese with/without diacritics)
+    name_patterns = [
+        r"(?:ten (?:la|toi la|cua toi la)|my name is|i am|i'm)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
+        r"(?:toi la|toi ten)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
+    ]
+    for pattern in name_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            facts["name"] = match.group(1).strip()
+            break
+
+    # Location patterns
+    location_patterns = [
+        r"(?:o|song o|live in|location|dia chi)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+        r"(?:toi o|toi song)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+    ]
+    for pattern in location_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            loc = match.group(1).strip().rstrip(".,")
+            # Filter out meeting places like "Hà Nội để gặp"
+            if not re.search(r"(?:de|cho|di|gap|hop|meeting|work|lam|lam viec)", loc, re.IGNORECASE):
+                facts["location"] = loc
+            break
+
+    # Profession patterns
+    profession_patterns = [
+        r"(?:lam|nghe|nghiep|work as|profession|job|job la)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+        r"(?:toi lam|toi la)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+    ]
+    for pattern in profession_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            prof = match.group(1).strip().rstrip(".,")
+            if not re.search(r"(?:de|cho|gap|hoc|study)", prof, re.IGNORECASE):
+                facts["profession"] = prof
+            break
+
+    # Preferences / response style
+    style_patterns = [
+        r"(?:phong cach\s+tra loi|phong cach|style|tra loi|reply)\s+(?:la|nhu|theo)?\s*([^,.!?]+)",
+        r"(?:toi muon|toi thich|i prefer|i like)\s+(?:tra loi|reply|style)\s+([^,.!?]+)",
+    ]
+    for pattern in style_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            facts["response_style"] = match.group(1).strip().rstrip(".,")
+            break
+
+    # Interests / favorites
+    interest_patterns = [
+        r"(?:thich|yeu thich|favorite|like|enjoy)\s+([^,.!?]+)",
+        r"(?:so thich|hobby|interest)\s+(?:la|cua toi la)\s+([^,.!?]+)",
+    ]
+    for pattern in interest_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            interest = match.group(1).strip().rstrip(".,")
+            if "food" not in interest.lower() and "do an" not in interest.lower() and "mon an" not in interest.lower():
+                facts["interests"] = interest
+            break
+
+    return facts
+
+
+def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
+    """Create a compact summary of older messages.
+
+    Heuristic: concatenate key exchanges, keeping it readable.
+    """
+    if not messages:
+        return ""
+
+    summary_parts = []
+    for msg in messages[-max_items:]:
+        role = msg.get("role", "user")
+        content = msg.get("content", "").strip()
+        if content:
+            # Truncate very long messages
+            if len(content) > 200:
+                content = content[:200] + "..."
+            summary_parts.append(f"{role}: {content}")
+
+    return "\n".join(summary_parts)
