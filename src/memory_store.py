@@ -246,13 +246,14 @@ def extract_profile_updates(message: str) -> dict[str, str]:
 
     # Skip questions very aggressively - use normalized text for diacritic-insensitive matching
     question_indicators = (
-        "?", "lam sao", "giup", "cho biet", "cho toi", "biet", "co phai",
+        "?", "lam sao", "giup", "cho biet", "cho toi", "co phai",
         "what", "how", "who", "where", "when", "why", "can you",
         "could you", "tell me", "explain", "ban co", "ban biet",
-        "nhac lai", "thu nhac", "kiem tra", "test", "ten gi", "o dau",
+        "nhac lai", "thu nhac", "kiem tra", "ten gi", "o dau",
         "nghe gi", "lam gi", "thich gi", "dung khong", "sai khong",
-        "nhin thay", "co phai", "la ai", "la gi", "nhu the nao",
-        "biet"  # "khong" removed - too common in statements
+        "nhin thay", "co phai", "la ai", "la gi", "nhu the nao"
+        # "test" removed - matches "testuser" in names
+        # "biet" removed - too broad, matches "ban" (bạn) in greetings
     )
     if any(q in msg_norm_lower for q in question_indicators) or "?" in message:
         return facts
@@ -265,17 +266,16 @@ def extract_profile_updates(message: str) -> dict[str, str]:
 
     # Name patterns - can appear anywhere in statement
     name_patterns = [
+        # More specific: "tên là X" / "my name is X" - put first to avoid partial match
         r"(?:ten (?:la|toi la|cua toi la)|my name is|i am|i'm)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
+        # Less specific: "tôi là X" / "tôi tên X" 
         r"(?:toi la|toi ten|minh la|minh ten)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
     ]
     for pattern in name_patterns:
         match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
-            orig_match = re.search(pattern, message, re.IGNORECASE)
-            if orig_match:
-                facts["name"] = orig_match.group(1).strip()
-            else:
-                facts["name"] = match.group(1).strip()
+            # Use normalized match group directly (orig_match may fail due to diacritics)
+            facts["name"] = match.group(1).strip()
             break
 
     # Location patterns - "tôi/mình ở X" or "giờ/bây giờ/ngày nay tôi/mình (đang) ở X"
