@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,15 @@ def estimate_tokens(text: str) -> int:
     if not text or not text.strip():
         return 0
     return max(1, math.ceil(len(text.strip()) / 4))
+
+
+def _normalize_vietnamese(text: str) -> str:
+    """Remove diacritics from Vietnamese text for pattern matching."""
+    # Handle đ/Đ which don't decompose in NFD
+    text = text.replace("đ", "d").replace("Đ", "D")
+    # Normalize to NFD (decomposed), then remove combining characters
+    nfkd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower()
 
 
 @dataclass
@@ -126,11 +136,12 @@ class UserProfileStore:
         facts_lines = [f"- **{k}**: {v}" for k, v in facts.items()]
         facts_section = "\n".join(facts_lines)
 
-        # Replace the Facts section
+        # Replace the Facts section - find LAST occurrence to handle duplicates
         if "## Facts" in content:
-            before, _, after = content.partition("## Facts")
-            _, _, after = after.partition("\n\n")
-            new_content = before + "## Facts\n\n" + facts_section + "\n\n" + after
+            # Split by ## Facts and keep only the part before the last one
+            parts = content.split("## Facts")
+            before = "## Facts".join(parts[:-1])  # Everything before last ## Facts
+            new_content = before + "## Facts\n\n" + facts_section + "\n"
         else:
             new_content = content.rstrip() + "\n\n## Facts\n\n" + facts_section + "\n"
 
@@ -226,88 +237,176 @@ class CompactMemoryManager:
 def extract_profile_updates(message: str) -> dict[str, str]:
     """Extract stable profile facts from user message.
 
-    Looks for patterns like:
-    - "Tôi tên là X" / "My name is X"
-    - "Tôi ở X" / "I live in X" / "Tôi sống ở X"
-    - "Tôi làm X" / "I work as X" / "Nghề nghiệp: X"
-    - "Tôi thích X" / "I like X" / "Sở thích: X"
-    - "Phong cách: X" / "Style: X"
+    Only extracts from clear declarative statements, not questions or context.
     """
     facts = {}
     msg_lower = message.lower().strip()
+    msg_norm = _normalize_vietnamese(message)
+    msg_norm_lower = msg_norm.lower()
 
-    # Skip obvious questions (contain ? or start with question words)
-    question_starters = (
-        "lam sao", "giup", "cho biet", "cho toi", "biet", "co phai",
+    # Skip questions very aggressively - use normalized text for diacritic-insensitive matching
+    question_indicators = (
+        "?", "lam sao", "giup", "cho biet", "cho toi", "biet", "co phai",
         "what", "how", "who", "where", "when", "why", "can you",
-        "could you", "tell me", "explain"
+        "could you", "tell me", "explain", "ban co", "ban biet",
+        "nhac lai", "thu nhac", "kiem tra", "test", "ten gi", "o dau",
+        "nghe gi", "lam gi", "thich gi", "dung khong", "sai khong",
+        "nhin thay", "co phai", "la ai", "la gi", "nhu the nao",
+        "biet"  # "khong" removed - too common in statements
     )
-    if "?" in message or any(msg_lower.startswith(q) for q in question_starters):
+    if any(q in msg_norm_lower for q in question_indicators) or "?" in message:
         return facts
 
-    # Name patterns (handles both Vietnamese with/without diacritics)
+    # Skip if message contains recall/request language
+    recall_indicators = ("nhac", "ghi nho", "ghi nhớ", "luu", "luu giu", "ghi lai",
+                         "remember", "recall", "save", "store")
+    if any(w in msg_lower for w in recall_indicators):
+        return facts
+
+    # Name patterns - can appear anywhere in statement
     name_patterns = [
         r"(?:ten (?:la|toi la|cua toi la)|my name is|i am|i'm)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
-        r"(?:toi la|toi ten)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
+        r"(?:toi la|toi ten|minh la|minh ten)\s+([A-Za-zÀ-ỹ][\wÀ-ỹ]*(?:\s+[A-Za-zÀ-ỹ][\wÀ-ỹ]*)*)",
     ]
     for pattern in name_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
-            facts["name"] = match.group(1).strip()
+            orig_match = re.search(pattern, message, re.IGNORECASE)
+            if orig_match:
+                facts["name"] = orig_match.group(1).strip()
+            else:
+                facts["name"] = match.group(1).strip()
             break
 
-    # Location patterns
+    # Location patterns - "tôi/mình ở X" or "giờ/bây giờ/ngày nay tôi/mình (đang) ở X"
     location_patterns = [
-        r"(?:o|song o|live in|location|dia chi)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
-        r"(?:toi o|toi song)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+        r"(?:toi o|minh o|toi song|minh song|gio (?:toi|minh) (?:dang\s+)?o|bay gio (?:toi|minh) (?:dang\s+)?o|ngay nay (?:toi|minh) (?:dang\s+)?o)\s+([^,.!?\n]+?)(?:[,.\n]|$|\s+(?:va|chu|nhung|ma)\s+)",
     ]
     for pattern in location_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
             loc = match.group(1).strip().rstrip(".,")
-            # Filter out meeting places like "Hà Nội để gặp"
             if not re.search(r"(?:de|cho|di|gap|hop|meeting|work|lam|lam viec)", loc, re.IGNORECASE):
-                facts["location"] = loc
+                orig_match = re.search(pattern, message, re.IGNORECASE)
+                if orig_match:
+                    facts["location"] = orig_match.group(1).strip().rstrip(".,")
+                else:
+                    facts["location"] = loc
             break
 
-    # Profession patterns
+    # Profession patterns - "tôi/mình làm X" or "giờ/bây giờ chuyển sang X" - exclude "làm việc ở"
     profession_patterns = [
-        r"(?:lam|nghe|nghiep|work as|profession|job|job la)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
-        r"(?:toi lam|toi la)\s+([^,.!?\n]+?)(?:[,.\n]|$)",
+        # "tôi/mình làm X" but NOT "làm việc ở Y" or "làm ở Y"
+        r"(?:toi lam|minh lam)(?!\s+viec\s+o)(?!\s+o\s)\s+([^,.!?\n]+?)(?:[,.\n]|$|\s+va\s+)",
+        # "tôi/mình là X" (job title)
+        r"(?:toi la|minh la)\s+([^,.!?\n]+?)(?:[,.\n]|$|\s+va\s+)",
+        # "giờ/bây giờ chuyển sang X" - job change
+        r"(?:gio|bay gio|ngay nay)\s+chuyen sang\s+([^,.!?\n]+?)(?:[,.\n]|$|\s+va\s+)",
     ]
     for pattern in profession_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
             prof = match.group(1).strip().rstrip(".,")
-            if not re.search(r"(?:de|cho|gap|hoc|study)", prof, re.IGNORECASE):
-                facts["profession"] = prof
+            # Filter out work locations like "ở quán cà phê"
+            if not re.search(r"(?:o\s|tai\s|de\s+)", prof, re.IGNORECASE) and \
+               not re.search(r"(?:de|cho|gap|hoc|study)", prof, re.IGNORECASE):
+                orig_match = re.search(pattern, message, re.IGNORECASE)
+                if orig_match:
+                    facts["profession"] = orig_match.group(1).strip().rstrip(".,")
+                else:
+                    facts["profession"] = prof
             break
 
-    # Preferences / response style
+    # Preferences / response style - "mình muốn (bạn) trả lời X" or "phong cách X"
     style_patterns = [
-        r"(?:phong cach\s+tra loi|phong cach|style|tra loi|reply)\s+(?:la|nhu|theo)?\s*([^,.!?]+)",
-        r"(?:toi muon|toi thich|i prefer|i like)\s+(?:tra loi|reply|style)\s+([^,.!?]+)",
+        # "muốn (bạn) phong cách/trả lời là X"
+        r"(?:toi muon|minh muon|toi thich|minh thich|i prefer|i like)\s+(?:ban\s+)?(?:phong cach|style|tra loi|reply)\s+(?:la|nhu|theo)\s+([^,.!?]+)",
+        # "muốn (bạn) trả lời X" (without là/như/theo)
+        r"(?:toi muon|minh muon|toi thich|minh thich|i prefer|i like)\s+(?:ban\s+)?(?:tra loi|reply)\s+([^,.!?]+)",
+        # "phong cách/style là X" - requires là/như/theo or at start
+        r"(?:^|\s)(?:phong cach|style)\s+(?:la|nhu|theo)\s+([^,.!?]+)",
     ]
     for pattern in style_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
-            facts["response_style"] = match.group(1).strip().rstrip(".,")
+            orig_match = re.search(pattern, message, re.IGNORECASE)
+            if orig_match:
+                facts["response_style"] = orig_match.group(1).strip().rstrip(".,")
+            else:
+                facts["response_style"] = match.group(1).strip().rstrip(".,")
             break
 
-    # Interests / favorites
-    interest_patterns = [
-        r"(?:thich|yeu thich|favorite|like|enjoy)\s+([^,.!?]+)",
-        r"(?:so thich|hobby|interest)\s+(?:la|cua toi la)\s+([^,.!?]+)",
+    # Favorite drink / food - separate drink and food
+    favorite_drink_patterns = [
+        r"(?:do uong|đo uong)\s+(?:yeu thich|favorite)\s+(?:la|is)\s+([^,.!?]+)",
     ]
-    for pattern in interest_patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
+    for pattern in favorite_drink_patterns:
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
         if match:
-            interest = match.group(1).strip().rstrip(".,")
-            if "food" not in interest.lower() and "do an" not in interest.lower() and "mon an" not in interest.lower():
-                facts["interests"] = interest
+            orig_match = re.search(pattern, message, re.IGNORECASE)
+            if orig_match:
+                facts["favorite_drink"] = orig_match.group(1).strip().rstrip(".,")
+            else:
+                facts["favorite_drink"] = match.group(1).strip().rstrip(".,")
             break
+
+    favorite_food_patterns = [
+        r"(?:mon an)\s+(?:yeu thich|favorite)\s+(?:la|is)\s+([^,.!?]+)",
+    ]
+    for pattern in favorite_food_patterns:
+        match = re.search(pattern, msg_norm, re.IGNORECASE)
+        if match:
+            orig_match = re.search(pattern, message, re.IGNORECASE)
+            if orig_match:
+                facts["favorite_food"] = orig_match.group(1).strip().rstrip(".,")
+            else:
+                facts["favorite_food"] = match.group(1).strip().rstrip(".,")
+            break
+
+    # Also set generic favorite to drink if drink exists
+    if "favorite_drink" in facts and "favorite" not in facts:
+        facts["favorite"] = facts["favorite_drink"]
+
+    # Interests - "tôi/mình thích X" (not food)
+    interest_patterns = [
+        r"(?:toi thich|minh thich|i like|i enjoy)\s+([^,.!?]+)",
+    ]
+    if "favorite" not in facts and "favorite_drink" not in facts and "favorite_food" not in facts:
+        for pattern in interest_patterns:
+            match = re.search(pattern, msg_norm, re.IGNORECASE)
+            if match:
+                interest = match.group(1).strip().rstrip(".,")
+                if "food" not in interest.lower() and "do an" not in interest.lower() and "mon an" not in interest.lower():
+                    orig_match = re.search(pattern, message, re.IGNORECASE)
+                    if orig_match:
+                        facts["interests"] = orig_match.group(1).strip().rstrip(".,")
+                    else:
+                        facts["interests"] = interest
+                break
 
     return facts
+
+
+def _normalize_for_match(text: str) -> str:
+    """Normalize text for matching (lowercase, strip diacritics)."""
+    return _normalize_vietnamese(text).lower()
+
+
+def recall_points(answer: str, expected: list[str]) -> float:
+    """Return 0 / 0.5 / 1 depending on how many expected facts appear.
+
+    Matches are case-insensitive and diacritic-insensitive.
+    """
+    if not expected:
+        return 1.0
+    ans_norm = _normalize_for_match(answer)
+    found = sum(1 for exp in expected if _normalize_for_match(exp) in ans_norm)
+    ratio = found / len(expected)
+    if ratio == 1.0:
+        return 1.0
+    elif ratio >= 0.5:
+        return 0.5
+    return 0.0
 
 
 def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> str:
@@ -329,3 +428,10 @@ def summarize_messages(messages: list[dict[str, str]], max_items: int = 6) -> st
             summary_parts.append(f"{role}: {content}")
 
     return "\n".join(summary_parts)
+
+
+def load_conversations(path: Path) -> list[dict[str, Any]]:
+    """Read JSON conversations from disk."""
+    import json
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
