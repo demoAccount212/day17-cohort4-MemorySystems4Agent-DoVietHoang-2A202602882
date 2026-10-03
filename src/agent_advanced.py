@@ -9,6 +9,8 @@ from memory_store import (
     UserProfileStore,
     estimate_tokens,
     extract_profile_updates,
+    extract_profile_updates_with_confidence,
+    upsert_fact_with_confidence,
     summarize_messages,
 )
 from model_provider import build_chat_model
@@ -63,24 +65,26 @@ class AdvancedAgent:
 
     def _reply_offline(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
         """Deterministic advanced path with persistent memory and compaction."""
-        # 1. Extract stable profile facts from the incoming message
-        facts = extract_profile_updates(message)
-        for key, value in facts.items():
-            self.profile_store.upsert_fact(user_id, key, value)
+        # 1. Extract profile facts with confidence scores
+        confident_facts = extract_profile_updates_with_confidence(message)
+        
+        # 2. Apply confidence threshold before writing to User.md
+        for key, (value, confidence) in confident_facts.items():
+            upsert_fact_with_confidence(self.profile_store, user_id, key, value, confidence)
 
-        # 2. Append message to compact memory
+        # 3. Append message to compact memory
         self.compact_memory.append(thread_id, "user", message)
 
-        # 3. Estimate prompt context tokens (User.md + summary + recent messages)
+        # 4. Estimate prompt context tokens (User.md + summary + recent messages)
         prompt_tokens = self._estimate_prompt_context_tokens(user_id, thread_id)
 
-        # 4. Generate response using persisted memory
+        # 5. Generate response using persisted memory
         reply_text = self._offline_response(user_id, thread_id, message)
 
-        # 5. Append assistant reply to compact memory
+        # 6. Append assistant reply to compact memory
         self.compact_memory.append(thread_id, "assistant", reply_text)
 
-        # 6. Update token counters
+        # 7. Update token counters
         user_tokens = estimate_tokens(message)
         assistant_tokens = estimate_tokens(reply_text)
         self.thread_tokens[thread_id] = self.thread_tokens.get(thread_id, 0) + user_tokens + assistant_tokens

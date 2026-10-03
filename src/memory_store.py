@@ -387,6 +387,195 @@ def extract_profile_updates(message: str) -> dict[str, str]:
     return facts
 
 
+# ============================================================
+# BONUS: Confidence scoring & Conflict handling
+# ============================================================
+
+# Confidence threshold for writing to User.md (0.0 - 1.0)
+# Higher = more conservative, fewer but more reliable facts
+CONFIDENCE_THRESHOLD = 0.6
+
+# Correction patterns - indicate user is correcting previous info
+CORRECTION_PATTERNS = [
+    r"khong con\s+\w+\s+nua",      # "không còn X nữa"
+    r"khong phai\s+\w+",           # "không phải X"
+    r"dinh chinh",                  # "đính chính"
+    r"cap nhat",                    # "cập nhật"
+    r"thay doi",                    # "thay đổi"
+    r"sua\s+(?:doi|thong tin)",     # "sửa đổi" / "sửa thông tin"
+    r"chuyen sang",                 # "chuyển sang"
+    r"chuyen ve",                   # "chuyển về"
+    r"sua\s+thanh",                 # "sửa thành"
+    r"doi\s+thanh",                 # "đổi thành"
+    r"moi la",                      # "mới là"
+    r"update",                      # English
+    r"correct",                     # English
+    r"change\s+to",                 # English
+]
+
+# High confidence patterns (explicit statements)
+HIGH_CONFIDENCE_PATTERNS = {
+    "name": [r"ten (?:la|toi la|cua toi la)", r"my name is", r"i am", r"i'm"],
+    "location": [r"(?:toi|minh) (?:o|song o|dang o)", r"live in", r"location is"],
+    "profession": [r"(?:toi|minh) (?:lam|la)", r"work as", r"job is", r"chuyen sang"],
+    "response_style": [r"(?:muon|thich).*(?:phong cach|style|tra loi).*la", r"style.*la"],
+    "favorite_drink": [r"do uong yeu thich la", r"favorite drink is"],
+    "favorite_food": [r"mon an yeu thich la", r"favorite food is"],
+    "interests": [r"(?:toi|minh) thich", r"i like", r"i enjoy"],
+}
+
+# Low confidence patterns (ambiguous)
+LOW_CONFIDENCE_PATTERNS = {
+    "location": [r"gap o", r"hop o", r"den o", "di o"],
+    "profession": [r"nghe", r"lam viec"],
+}
+
+
+def _detect_correction(message: str) -> tuple[bool, list[str]]:
+    """Detect if message contains correction intent and which facts are being corrected.
+    
+    Returns:
+        (is_correction, list_of_fact_keys_being_corrected)
+    """
+    msg_lower = message.lower()
+    msg_norm = _normalize_vietnamese(message).lower()
+    
+    corrected_facts = []
+    
+    # Check for explicit correction keywords
+    for pattern in CORRECTION_PATTERNS:
+        if re.search(pattern, msg_norm, re.IGNORECASE):
+            # Try to infer which fact is being corrected
+            if any(w in msg_norm for w in ["o", "song", "dia chi", "live in", "location"]):
+                corrected_facts.append("location")
+            if any(w in msg_norm for w in ["lam", "nghe", "nghiep", "job", "work", "chuyen sang", "chuyen ve"]):
+                corrected_facts.append("profession")
+            if any(w in msg_norm for w in ["ten", "name", "goi la"]):
+                corrected_facts.append("name")
+            if any(w in msg_norm for w in ["phong cach", "style", "tra loi"]):
+                corrected_facts.append("response_style")
+            if any(w in msg_norm for w in ["do uong", "drink", "mon an", "food"]):
+                corrected_facts.append("favorite_drink")
+                corrected_facts.append("favorite_food")
+            if any(w in msg_norm for w in ["thich", "yeu thich", "like", "enjoy"]):
+                corrected_facts.append("interests")
+            break
+    
+    return (len(corrected_facts) > 0, list(set(corrected_facts)))
+
+
+def _compute_fact_confidence(fact_key: str, fact_value: str, message: str, 
+                             is_correction: bool = False) -> float:
+    """Compute confidence score (0.0-1.0) for an extracted fact.
+    
+    Factors:
+    - Pattern specificity (explicit vs implicit)
+    - Correction context (higher confidence for corrections)
+    - Fact type (some types more reliable)
+    - Value length/quality
+    """
+    base_confidence = 0.5
+    msg_norm = _normalize_vietnamese(message).lower()
+    
+    # Boost for explicit correction intent
+    if is_correction:
+        base_confidence += 0.3
+    
+    # Check high-confidence patterns
+    if fact_key in HIGH_CONFIDENCE_PATTERNS:
+        for pattern in HIGH_CONFIDENCE_PATTERNS[fact_key]:
+            if re.search(pattern, msg_norm, re.IGNORECASE):
+                base_confidence += 0.2
+                break
+    
+    # Penalize low-confidence patterns
+    if fact_key in LOW_CONFIDENCE_PATTERNS:
+        for pattern in LOW_CONFIDENCE_PATTERNS[fact_key]:
+            if re.search(pattern, msg_norm, re.IGNORECASE):
+                base_confidence -= 0.2
+                break
+    
+    # Fact-specific adjustments
+    if fact_key == "name":
+        # Names are usually explicit
+        base_confidence += 0.1
+    elif fact_key in ("favorite_drink", "favorite_food"):
+        # Explicit favorites are reliable
+        if re.search(r"yeu thich|favorite", msg_norm):
+            base_confidence += 0.15
+    elif fact_key == "interests":
+        # Generic "thich" can be noisy
+        base_confidence -= 0.1
+    elif fact_key == "location":
+        # Check for meeting place noise
+        if re.search(r"(?:de|cho|di|gap|hop|meeting|work|lam|lam viec)", fact_value, re.IGNORECASE):
+            base_confidence -= 0.3
+    
+    # Value quality checks
+    if len(fact_value.strip()) < 2:
+        base_confidence -= 0.3
+    elif len(fact_value.strip()) > 50:
+        base_confidence -= 0.1
+    
+    # Clamp to [0, 1]
+    return max(0.0, min(1.0, base_confidence))
+
+
+def extract_profile_updates_with_confidence(message: str) -> dict[str, tuple[str, float]]:
+    """Extract profile facts with confidence scores.
+    
+    Returns:
+        Dict mapping fact_key -> (fact_value, confidence_score)
+    """
+    # First get raw facts
+    raw_facts = extract_profile_updates(message)
+    
+    # Detect correction intent
+    is_correction, corrected_keys = _detect_correction(message)
+    
+    # Compute confidence for each fact
+    confident_facts = {}
+    for key, value in raw_facts.items():
+        confidence = _compute_fact_confidence(key, value, message, 
+                                               is_correction=(key in corrected_keys))
+        confident_facts[key] = (value, confidence)
+    
+    return confident_facts
+
+
+def upsert_fact_with_confidence(store: UserProfileStore, user_id: str, 
+                                key: str, value: str, confidence: float,
+                                threshold: float = CONFIDENCE_THRESHOLD) -> bool:
+    """Insert or update a fact with confidence checking.
+    
+    Args:
+        store: UserProfileStore instance
+        user_id: User identifier
+        key: Fact key
+        value: Fact value
+        confidence: Confidence score (0.0-1.0)
+        threshold: Minimum confidence to write
+    
+    Returns:
+        True if fact was written, False if rejected (below threshold)
+    """
+    if confidence < threshold:
+        return False
+    
+    # For corrections, we always allow updates (even if lower confidence)
+    # but only if explicitly marked as correction
+    current_facts = store.facts(user_id)
+    is_update = key in current_facts and current_facts[key] != value
+    
+    if is_update:
+        # Allow updates with slightly lower threshold for corrections
+        if confidence < threshold * 0.8:
+            return False
+    
+    store.upsert_fact(user_id, key, value)
+    return True
+
+
 def _normalize_for_match(text: str) -> str:
     """Normalize text for matching (lowercase, strip diacritics)."""
     return _normalize_vietnamese(text).lower()

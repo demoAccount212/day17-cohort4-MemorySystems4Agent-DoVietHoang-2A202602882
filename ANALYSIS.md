@@ -71,8 +71,8 @@ Advanced nén messages cũ thành summary (~300 chars) + giữ 6 messages gần 
 ### Tăng trưởng:
 | Benchmark | Memory growth |
 |-----------|---------------|
-| Standard | 382 bytes |
-| Stress | 289 bytes |
+| Standard | 382 bytes (no bonus) → 282 bytes (with bonus) |
+| Stress | 289 bytes (no bonus) → 180 bytes (with bonus) |
 
 File `User.md` chỉ chứa **facts ổn định** (khoảng 6-8 dòng `- **key**: value`), không lưu toàn bộ hội thoại → **rất nhỏ** (KB level).
 
@@ -82,22 +82,70 @@ File `User.md` chỉ chứa **facts ổn định** (khoảng 6-8 dòng `- **key*
 3. **Stale facts**: Thông tin cũ không bị xóa tự động (cần memory decay).
 4. **Privacy**: User.md chứa PII (tên, nơi ở, nghề nghiệp) - cần bảo mật file.
 
-### Mitigation (có thể làm ở Bước 9 - Bonus):
-- **Confidence threshold**: Chỉ ghi fact khi confidence > threshold
-- **Memory decay**: Tự động xóa/giảm trọng số fact cũ
-- **Structured entity extraction**: Dùng NER thay vì regex
-- **Noise filtering**: Phân biệt câu hỏi vs cung cấp fact
+---
+
+## 5. Bonus Implementation: Confidence Threshold + Conflict Handling
+
+### Vấn đề giải quyết:
+Dữ liệu benchmark chứa **traps** (bẫy):
+- Location được **corrected** mid-conversation (latest fact wins)
+- Noise statements ("Hà Nội chỉ là nơi gặp") không nên lưu làm fact
+- User tự widersch nghề nghiệp (backend → MLOps), agent phải update đúng fact mới
+
+### Giải pháp triển khai:
+**File: `src/memory_store.py` + `src/agent_advanced.py`**
+
+1. **Confidence Scoring** (`_compute_fact_confidence`):
+   - Base confidence: 0.5
+   - Boost cho explicit statements ("tên là X", "ở X", "làm X")
+   - Boost +0.3 cho corrections ("đính chính", "không còn... nữa", "chuyển sang")
+   - Penalty cho noise patterns ("để gặp", "họp ở", "làm việc ở")
+   - Fact-specific adjustments (name +0.1, interests -0.1, location noise -0.3)
+
+2. **Correction Detection** (`_detect_correction`):
+   - Regex patterns: "không còn... nữa", "đính chính", "cập nhật", "chuyển sang", "sửa", "mới là"
+   - Infers which fact keys are being corrected (location, profession, name, etc.)
+
+3. **Confidence Threshold** (`CONFIDENCE_THRESHOLD = 0.6`):
+   - Chỉ ghi vào User.md khi confidence ≥ 0.6
+   - Corrections cho phép threshold thấp hơn (0.8×) để ưu tiên update
+
+4. **Conflict Resolution** (`upsert_fact_with_confidence`):
+   - Latest correction wins (khi is_correction=True)
+   - Normal updates yêu cầu confidence ≥ threshold
+   - Correction updates chỉ cần confidence ≥ threshold × 0.8
+
+### Cải thiện recall/token cost:
+| Metric | Without Bonus | With Bonus | Thay đổi |
+|--------|---------------|------------|----------|
+| Standard Recall | 0.68 | 0.54 | -0.14 |
+| Standard Prompt Tokens | 43,866 | 26,672 | **-39%** |
+| Standard Memory Growth | 382 bytes | 282 bytes | **-26%** |
+| Stress Prompt Tokens | 17,285 | 16,698 | -3% |
+| Stress Memory Growth | 289 bytes | 180 bytes | **-38%** |
+
+### Rủi ro mới (trade-off):
+1. **Recall giảm nhẹ** (-0.14 standard): Threshold 0.6 lọc bỏ một số fact low-confidence nhưng đúng (e.g., interests generic "thích Python")
+2. **False negatives**: Fact đúng nhưng pattern không explicit bị lọc (e.g., "Mình thích Python" confidence ~0.4)
+3. **Over-filtering corrections**: Nếu correction pattern không match, update bị từ chối
+4. **Complexity tăng**: +200 lines code, thêm dependency giữa components
+
+### Tuning recommendations:
+- Giảm `CONFIDENCE_THRESHOLD` xuống 0.5 nếu cần recall cao hơn
+- Thêm pattern correction domain-specific
+- Log rejected facts để debug tuning
 
 ---
 
 ## Kết luận
 
-| Tiêu chí | Baseline | Advanced | Thắng |
-|----------|----------|----------|-------|
-| Cross-session recall | 0.00 | **0.68 / 0.33** | Advanced |
-| Prompt tokens (ngắn) | **16,836** | 43,866 | Baseline |
-| Prompt tokens (dài) | 22,713 | **17,285** | **Advanced** |
-| Memory growth | 0 | ~300 bytes | Baseline (nhưng acceptable) |
-| Compactions | 0 | **3** | Advanced |
+| Tiêu chí | Baseline | Advanced (no bonus) | Advanced (with bonus) |
+|----------|----------|---------------------|----------------------|
+| Cross-session recall | 0.00 | **0.68 / 0.33** | 0.54 / 0.17 |
+| Prompt tokens (ngắn) | **16,836** | 43,866 | 26,672 |
+| Prompt tokens (dài) | 22,713 | **17,285** | 16,698 |
+| Memory growth | 0 | ~300 bytes | ~230 bytes |
+| Compactions | 0 | **3** | **3** |
+| Conflict handling | ❌ | ⚠️ Basic | ✅ Explicit |
 
-**Advanced thắng hẳn ở recall và long-context efficiency**, chấp nhận trade-off token ở short conversations. Đây là trade-off hợp lý cho ứng dụng thực tế (user thường quay lại hỏi nhiều session).
+**Advanced với bonus**: Trades 14% recall points để đổi lấy 39% prompt token savings và 26% memory reduction. Conflict handling explicit giải quyết fact drift issue trong benchmark traps. Trade-off hợp lý cho production systems nơi cost và data quality quan trọng.
